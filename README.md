@@ -110,7 +110,7 @@ provider "aws" {
 - `required_version` sikrer at Terraform-versjonen er minst 1.0
 - `required_providers` spesifiserer AWS provider versjon (~> 5.0 betyr versjon 5.x)
 - Default provider bruker `eu-west-1`
-- Aliased provider for `us-east-1` vil brukes senere for ACM-sertifikater (se [Appendix A](#appendix-a-provider-configuration-i-moduler))
+- Aliased provider for `us-east-1` vil brukes senere for ACM-sertifikater (se [bonusoppgaven om egendefinert domene](#bonusoppgave-egendefinert-domene-med-https-acm--cloudfront))
 
 2. **Opprett `main.tf`** i rotmappen av prosjektet
 
@@ -184,7 +184,7 @@ resource "aws_s3_bucket_policy" "website" {
 
 ```hcl
 output "s3_website_url" {
-  value = "http://${aws_s3_bucket.website.bucket}.s3-website.${aws_s3_bucket.website.region}.amazonaws.com"
+  value       = "http://${aws_s3_bucket_website_configuration.website.website_endpoint}"
   description = "URL for the S3 hosted website"
 }
 ```
@@ -316,6 +316,174 @@ Prøv å endre HTML- og CSS-filene i `s3_demo_website`-mappen, og kjør sync-kom
 ```bash
   aws s3 sync s3_demo_website/dist s3://unikt-bucket-navn
 ```
+
+### Bonusoppgave: Egendefinert domene med HTTPS (ACM + CloudFront)
+
+Så langt serveres nettsiden over `http://` på en S3-website-URL. I denne bonusoppgaven legger du en CloudFront-distribusjon foran S3-bucketen, utsteder et TLS-sertifikat med ACM, og peker et eget domenenavn mot distribusjonen via Route53. Resultatet er en nettside som svarer på `https://ditt-domene` med et gyldig sertifikat.
+
+Her får du endelig bruk for `us-east-1`-provideren du satte opp i `providers.tf`: CloudFront krever at ACM-sertifikatet ligger i `us-east-1`, uansett hvilken region resten av infrastrukturen din bruker.
+
+Dette er en flerbruker-øving: alle studentene deler den samme hosted zonen `thecloudcollege.com`. For å unngå kollisjoner får hver student sitt eget **unike subdomene** (f.eks. `glennbech.thecloudcollege.com`), styrt av variabelen `student_id`.
+
+> **Forutsetning**: Alle studentene har en IAM-bruker i den samme AWS-kontoen, og den kontoen eier hosted zonen `thecloudcollege.com`. Både ACM-valideringen og alias-recorden skrives inn i denne delte sonen, så et unikt `student_id` er det som holder studentenes records fra hverandre.
+
+1. **Legg til en variabel for din student-ID** i `main.tf`. Sett din egen unike student-ID som `default`, slik at du kan kjøre `terraform apply` uten å oppgi den på kommandolinjen hver gang:
+
+```hcl
+variable "student_id" {
+  description = "Din unike student-ID (initialer eller studentnummer). Brukes som subdomene, og må være unik blant studentene."
+  type        = string
+  default     = "dittnavn" # Erstatt med din egen unike student-ID
+}
+
+locals {
+  # Felles hosted zone som alle studentene deler
+  zone_name = "thecloudcollege.com"
+
+  # Hver student får sitt eget subdomene, f.eks. glennbech.thecloudcollege.com
+  domain_name = "${var.student_id}.${local.zone_name}"
+}
+```
+
+2. **Slå opp den delte hosted zonen** (Terraform finner zone-IDen for deg, så du slipper å hardkode den). Merk at oppslaget bruker apex-domenet `thecloudcollege.com`, ikke ditt subdomene:
+
+```hcl
+data "aws_route53_zone" "main" {
+  name         = local.zone_name
+  private_zone = false
+}
+```
+
+3. **Be ACM om et sertifikat** i `us-east-1`, med DNS-validering:
+
+```hcl
+resource "aws_acm_certificate" "website" {
+  provider          = aws.us-east-1
+  domain_name       = local.domain_name
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+4. **Opprett valideringsrecordene i Route53**. ACM gir deg en CNAME-record per domene som beviser at du eier domenet; `aws_acm_certificate_validation` venter til valideringen er fullført:
+
+```hcl
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.website.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+
+resource "aws_acm_certificate_validation" "website" {
+  provider                = aws.us-east-1
+  certificate_arn         = aws_acm_certificate.website.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+}
+```
+
+5. **Opprett CloudFront-distribusjonen** med S3-website-endepunktet som origin. Siden dette er et website-endepunkt (ikke REST-endepunktet), brukes `custom_origin_config` med `http-only` mot origin, mens `viewer_protocol_policy` tvinger brukere over på HTTPS:
+
+> **Tålmodighet**: Utrulling av en CloudFront-distribusjon tar vanligvis 5–10 minutter. `terraform apply` vil stå og vise `Still creating...` i hele denne perioden — det er helt normalt. **Ikke avbryt med Ctrl-C**, da kan Terraform-staten bli korrupt.
+
+```hcl
+resource "aws_cloudfront_distribution" "website" {
+  enabled             = true
+  default_root_object = "index.html"
+  aliases             = [local.domain_name]
+
+  origin {
+    domain_name = aws_s3_bucket_website_configuration.website.website_endpoint
+    origin_id   = "s3-website"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "s3-website"
+    viewer_protocol_policy = "redirect-to-https"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.website.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+}
+```
+
+6. **Pek domenet mot CloudFront** med en Route53 alias-record. En alias-record er en AWS-spesifikk record som peker direkte på en AWS-ressurs uten å koste et ekstra DNS-oppslag:
+
+```hcl
+resource "aws_route53_record" "website" {
+  zone_id = data.aws_route53_zone.main.zone_id
+  name    = local.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.website.domain_name
+    zone_id                = aws_cloudfront_distribution.website.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+```
+
+7. **Legg til en output for HTTPS-URL-en**:
+
+```hcl
+output "website_https_url" {
+  value       = "https://${local.domain_name}"
+  description = "HTTPS-URL for nettsiden via CloudFront"
+}
+```
+
+8. **Apply endringene**:
+
+```bash
+terraform apply
+```
+
+Legg merke til at `terraform apply` kan bruke flere minutter: ACM-validering og utrulling av CloudFront-distribusjonen tar tid. Når det er ferdig, åpne `https://<student_id>.thecloudcollege.com` i nettleseren og bekreft at sertifikatet er gyldig (hengelås i adresselinjen).
+
+## Appendix B: Privat bucket i en produksjonssetting
+
+Oppsettet over lar S3-bucketen være offentlig lesbar. CloudFront fungerer da som et lag foran en bucket som fortsatt er direkte tilgjengelig på sitt eget website-endepunkt. Det er pedagogisk enkelt, men avviker fra anbefalt praksis i produksjon.
+
+I en produksjonssetting gjøres bucketen privat, og CloudFront gis eksklusiv lesetilgang gjennom en **Origin Access Control (OAC)** — etterfølgeren til den eldre Origin Access Identity (OAI). Trafikken rutes da mot S3 sitt **REST-endepunkt** i stedet for website-endepunktet, bucket-policyen begrenses til CloudFront sin service-principal, og `aws_s3_bucket_public_access_block` settes tilbake til å blokkere all offentlig tilgang. Dette sikrer at innhold kun kan hentes gjennom CloudFront, slik at tilgangskontroll, logging og caching ikke kan omgås.
+
+Avveiningen er økt kompleksitet: REST-endepunktet utfører ikke website-endepunktets automatiske oppslag av `index.html` for underkataloger, så ruting for en single-page application må håndteres eksplisitt — typisk med `custom_error_response`-regler eller en CloudFront Function. Fordi dette introduserer en annen origin-arkitektur og flere ressurser, er det utelatt fra bonusoppgaven, men nevnes her som det anbefalte sikkerhetsmønsteret for reelle driftsmiljøer.
 
 ## Oppsummering
 

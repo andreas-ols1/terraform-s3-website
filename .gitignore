@@ -1,2 +1,23 @@
-
+# Node
 *node_modules*
+s3_demo_website/dist/
+
+# Terraform
+# Note: .terraform.lock.hcl SHOULD be committed (pins provider versions) — so it is not ignored here.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# Terraform variable files (may contain secrets)
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# AWS / local credentials
+.aws/
