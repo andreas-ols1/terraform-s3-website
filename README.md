@@ -45,6 +45,11 @@ En **fork** er din egen kopi av et GitHub-repo under din egen konto. Du jobber i
 
 **Tips**: Trykk `.` (punktum) når du er i et GitHub repository for å åpne det direkte i en nettleser-basert VS Code editor. Dette er raskere enn å starte en full Codespace for små editeringer.
 
+Konfigurer AWS-nøkler i Codespace
+Terraform og AWS CLI trenger AWS-nøkler for å kunne snakke med AWS-kontoen din. En Codespace starter uten disse.
+
+Du kan få utdelt Access Key ID og Secret Access Key i klasserommet, eller lage dem selv i IAM — se https://github.com/glennbechdevops/aws-iam-accesskeys. 
+
 ### Konfigurer AWS-nøkler i Codespace
 
 Terraform og AWS CLI trenger AWS-nøkler for å kunne snakke med AWS-kontoen din. En Codespace starter uten disse, så du må konfigurere dem én gang per Codespace.
